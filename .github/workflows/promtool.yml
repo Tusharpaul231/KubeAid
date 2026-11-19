@@ -1,0 +1,75 @@
+name: Promtool
+
+"on":
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - 'build/kube-prometheus/mixins/**'
+      - '.github/workflows/promtool.yml'
+
+permissions:
+  contents: read
+
+# This will only allow a single promtool action to run per PR.
+# Any github action running on the older commits will be aborted.
+concurrency:
+  group: promtool-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PROMETHEUS_VERSION: 3.5.0
+
+jobs:
+  promtool:
+    name: Prometheus mixin rules check and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install promtool
+        run: |
+          set -euo pipefail
+          archive="prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          base="https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}"
+          curl -fsSLO "${base}/${archive}"
+          curl -fsSLO "${base}/sha256sums.txt"
+          grep " ${archive}\$" sha256sums.txt | sha256sum -c -
+          tar -xzf "${archive}" --strip-components=1 \
+            "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+          sudo install -m 0755 promtool /usr/local/bin/promtool
+          promtool --version
+
+      # Every mixin must ship a compiled prometheus.yaml. Each one is validated with
+      # `promtool check rules`, and any test*.yaml next to it (test.yaml, tests.yaml,
+      # testUnsuccessfulBackup.yaml, ...) is run with `promtool test rules`.
+      # The tests list `prometheus.yaml` in rule_files (a relative path), so promtool
+      # has to run from inside the mixin directory.
+      # Every mixin is checked even if an earlier one fails, so one run shows all failures.
+      - name: Check and test Prometheus mixin rules
+        working-directory: build/kube-prometheus/mixins
+        run: |
+          shopt -s nullglob
+          failed=0
+          for dir in */; do
+            dir="${dir%/}"
+            echo "::group::${dir}"
+            if [ ! -f "${dir}/prometheus.yaml" ]; then
+              echo "::error::${dir}: prometheus.yaml not found"
+              failed=1
+              echo "::endgroup::"
+              continue
+            fi
+            promtool check rules "${dir}/prometheus.yaml" || failed=1
+            for test_file in "${dir}"/test*.yaml; do
+              (cd "${dir}" && promtool test rules "$(basename "${test_file}")") || failed=1
+            done
+            echo "::endgroup::"
+          done
+          exit "${failed}"
